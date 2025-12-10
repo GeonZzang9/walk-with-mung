@@ -134,4 +134,3 @@ export const SchedulePage = () => {
         </div>
     );
 };
-

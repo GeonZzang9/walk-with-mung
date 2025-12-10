@@ -110,4 +110,3 @@ export const DogCard = ({ dog, onClick, onComplete, onReset, onStartWalk }: DogC
         </div>
     );
 };
-

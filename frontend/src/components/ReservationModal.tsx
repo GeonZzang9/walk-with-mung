@@ -125,4 +125,3 @@ export const ReservationModal = ({ dog, onClose, onReserved }: ReservationModalP
         </div>
     );
 };
-

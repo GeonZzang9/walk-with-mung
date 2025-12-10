@@ -259,4 +259,3 @@ export const CompletedDogsPage = () => {
         </div>
     );
 };
-

@@ -139,4 +139,3 @@ export const HomePage = ({ autoScrollToList = false }: HomePageProps) => {
         </div>
     );
 };
-
