@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const db = require('./db');
+const pool = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -14,7 +14,8 @@ app.use(
 );
 app.use(express.json());
 
-app.get('/api/dogs', (req, res) => {
+// 모든 강아지 목록 + 최신 예약자 이름
+app.get('/api/dogs', async (req, res) => {
   const sql = `
     SELECT
       d.id,
@@ -36,17 +37,17 @@ app.get('/api/dogs', (req, res) => {
     FROM dogs d
   `;
 
-  db.all(sql, (err, rows) => {
-    if (err) {
-      console.error('Error fetching dogs', err);
-      return res.status(500).json({ error: 'Failed to fetch dogs' });
-    }
-
+  try {
+    const [rows] = await pool.query(sql);
     res.json(rows);
-  });
+  } catch (err) {
+    console.error('Error fetching dogs', err);
+    return res.status(500).json({ error: 'Failed to fetch dogs' });
+  }
 });
 
-app.post('/api/reservations', (req, res) => {
+// 예약 생성
+app.post('/api/reservations', async (req, res) => {
   const { dogId, time, reserverName, reserverPhone } = req.body;
 
   if (!dogId || !time || !reserverName || !reserverPhone) {
@@ -57,111 +58,92 @@ app.post('/api/reservations', (req, res) => {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  db.run(
-    'INSERT INTO reservations (dog_id, date, time, status, reserver_name, reserver_phone) VALUES (?, ?, ?, ?, ?, ?)',
-    [dogId, today, time, 'reserved', reserverName, reserverPhone],
-    function insertCallback(err) {
-      if (err) {
-        console.error('Error creating reservation', err);
-        return res.status(500).json({ error: 'Failed to create reservation' });
-      }
+  try {
+    const [result] = await pool.query(
+      'INSERT INTO reservations (dog_id, date, time, status, reserver_name, reserver_phone) VALUES (?, ?, ?, ?, ?, ?)',
+      [dogId, today, time, 'reserved', reserverName, reserverPhone]
+    );
 
-      db.run(
-        'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ?',
-        ['reserved', dogId],
-        (updateErr) => {
-          if (updateErr) {
-            console.error('Error updating dog status', updateErr);
-          }
+    await pool.query(
+      'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ?',
+      ['reserved', dogId]
+    );
 
-          res.status(201).json({
-            id: this.lastID,
-            dogId,
-            date: today,
-            time,
-            reserverName,
-            reserverPhone,
-            status: 'reserved',
-          });
-        }
-      );
-    }
-  );
+    res.status(201).json({
+      id: result.insertId,
+      dogId,
+      date: today,
+      time,
+      reserverName,
+      reserverPhone,
+      status: 'reserved',
+    });
+  } catch (err) {
+    console.error('Error creating reservation', err);
+    return res.status(500).json({ error: 'Failed to create reservation' });
+  }
 });
 
-app.post('/api/dogs/:id/complete', (req, res) => {
+// 산책 완료 처리
+app.post('/api/dogs/:id/complete', async (req, res) => {
   const dogId = req.params.id;
   const { reserverName, reserverPhone } = req.body || {};
 
   const now = new Date();
-  const completedTime = `${padTime(now.getHours())}:${padTime(
-    now.getMinutes()
-  )}`;
+  const completedTime = `${padTime(now.getHours())}:${padTime(now.getMinutes())}`;
 
-  const performComplete = (completedBy = 'manual') => {
-    db.serialize(() => {
-      db.run(
-        'UPDATE dogs SET status = ?, lastWalkTime = ?, currentWalkEnd = NULL WHERE id = ?',
-        ['completed', completedTime, dogId],
-        (err) => {
-          if (err) {
-            console.error('Error completing walk', err);
-          }
-        }
-      );
+  const performComplete = async (completedBy = 'manual') => {
+    await pool.query(
+      'UPDATE dogs SET status = ?, lastWalkTime = ?, currentWalkEnd = NULL WHERE id = ?',
+      ['completed', completedTime, dogId]
+    );
 
-      db.run(
-        `UPDATE reservations
-         SET status = 'completed', walk_end_time = ?, completed_by = ?
-         WHERE id = (
-           SELECT MAX(id) FROM reservations WHERE dog_id = ?
-         )`,
-        [completedTime, completedBy, dogId],
-        (resErr) => {
-          if (resErr) {
-            console.error('Error updating reservation status', resErr);
-            return res.status(500).json({ error: 'Failed to complete reservation' });
-          }
+    await pool.query(
+      `UPDATE reservations
+       SET status = 'completed', walk_end_time = ?, completed_by = ?
+       WHERE id = (
+         SELECT MAX(id) FROM reservations WHERE dog_id = ?
+       )`,
+      [completedTime, completedBy, dogId]
+    );
 
-          return res.json({ dogId: Number(dogId), completedTime, status: 'completed' });
-        }
-      );
-    });
+    return res.json({ dogId: Number(dogId), completedTime, status: 'completed' });
   };
 
-  // 예약자 정보가 함께 온 경우에는 검증 후 완료 처리
-  if (reserverName && reserverPhone) {
-    db.get(
-      `SELECT reserver_name AS reserverName, reserver_phone AS reserverPhone
-       FROM reservations
-       WHERE dog_id = ?
-       ORDER BY id DESC
-       LIMIT 1`,
-      [dogId],
-      (err, row) => {
-        if (err) {
-          console.error('Error verifying reservation for completion', err);
-          return res.status(500).json({ error: 'Failed to verify reservation' });
-        }
+  try {
+    // 예약자 정보가 함께 온 경우 검증
+    if (reserverName && reserverPhone) {
+      const [rows] = await pool.query(
+        `SELECT reserver_name AS reserverName, reserver_phone AS reserverPhone
+         FROM reservations
+         WHERE dog_id = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [dogId]
+      );
+      const row = rows[0];
 
-        if (
-          !row ||
-          row.reserverName !== reserverName ||
-          row.reserverPhone !== reserverPhone
-        ) {
-          return res.status(400).json({ error: '예약자 정보가 일치하지 않습니다.' });
-        }
-
-        performComplete('manual');
+      if (
+        !row ||
+        row.reserverName !== reserverName ||
+        row.reserverPhone !== reserverPhone
+      ) {
+        return res.status(400).json({ error: '예약자 정보가 일치하지 않습니다.' });
       }
-    );
-  } else {
-    // 예약자 정보가 없으면 기존 동작 유지 (예: 관리자용)
-    performComplete('system');
+
+      await performComplete('manual');
+    } else {
+      // 시스템/관리자에 의한 완료 처리
+      await performComplete('system');
+    }
+  } catch (err) {
+    console.error('Error completing walk', err);
+    return res.status(500).json({ error: 'Failed to complete reservation' });
   }
 });
 
-app.post('/api/dogs/:id/start-walk', (req, res) => {
+// 산책 시작
+app.post('/api/dogs/:id/start-walk', async (req, res) => {
   const dogId = req.params.id;
   const { reserverName, reserverPhone } = req.body || {};
 
@@ -169,67 +151,54 @@ app.post('/api/dogs/:id/start-walk', (req, res) => {
     return res.status(400).json({ error: 'reserverName and reserverPhone are required' });
   }
 
-  db.get(
-    `SELECT id, date, time, status, reserver_name AS reserverName, reserver_phone AS reserverPhone
-     FROM reservations
-     WHERE dog_id = ?
-     ORDER BY id DESC
-     LIMIT 1`,
-    [dogId],
-    (err, row) => {
-      if (err) {
-        console.error('Error fetching latest reservation for start-walk', err);
-        return res.status(500).json({ error: 'Failed to fetch reservation' });
-      }
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, date, time, status, reserver_name AS reserverName, reserver_phone AS reserverPhone
+       FROM reservations
+       WHERE dog_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [dogId]
+    );
+    const row = rows[0];
 
-      if (!row || row.status !== 'reserved') {
-        return res.status(400).json({ error: '시작할 수 있는 예약이 없습니다.' });
-      }
-
-      if (row.reserverName !== reserverName || row.reserverPhone !== reserverPhone) {
-        return res.status(400).json({ error: '예약자 정보가 일치하지 않습니다.' });
-      }
-
-      const now = new Date();
-      const startTime = `${padTime(now.getHours())}:${padTime(now.getMinutes())}`;
-      const endDate = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-      const endTime = `${padTime(endDate.getHours())}:${padTime(endDate.getMinutes())}`;
-
-      db.serialize(() => {
-        db.run(
-          'UPDATE dogs SET status = ?, currentWalkEnd = ? WHERE id = ?',
-          ['walking', endTime, dogId],
-          (updateErr) => {
-            if (updateErr) {
-              console.error('Error updating dog to walking', updateErr);
-              return res.status(500).json({ error: 'Failed to update dog status' });
-            }
-
-            db.run(
-              'UPDATE reservations SET status = ?, walk_start_time = ?, walk_end_time = ? WHERE id = ?',
-              ['walking', startTime, endTime, row.id],
-              (resErr) => {
-                if (resErr) {
-                  console.error('Error updating reservation to walking', resErr);
-                  return res.status(500).json({ error: 'Failed to update reservation status' });
-                }
-
-                return res.json({
-                  dogId: Number(dogId),
-                  reservationId: row.id,
-                  status: 'walking',
-                  currentWalkEnd: endTime,
-                });
-              }
-            );
-          }
-        );
-      });
+    if (!row || row.status !== 'reserved') {
+      return res.status(400).json({ error: '진행 중인 예약이 없는 상태입니다.' });
     }
-  );
+
+    if (row.reserverName !== reserverName || row.reserverPhone !== reserverPhone) {
+      return res.status(400).json({ error: '예약자 정보가 일치하지 않습니다.' });
+    }
+
+    const now = new Date();
+    const startTime = `${padTime(now.getHours())}:${padTime(now.getMinutes())}`;
+    const endDate = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+    const endTime = `${padTime(endDate.getHours())}:${padTime(endDate.getMinutes())}`;
+
+    await pool.query(
+      'UPDATE dogs SET status = ?, currentWalkEnd = ? WHERE id = ?',
+      ['walking', endTime, dogId]
+    );
+
+    await pool.query(
+      'UPDATE reservations SET status = ?, walk_start_time = ?, walk_end_time = ? WHERE id = ?',
+      ['walking', startTime, endTime, row.id]
+    );
+
+    return res.json({
+      dogId: Number(dogId),
+      reservationId: row.id,
+      status: 'walking',
+      currentWalkEnd: endTime,
+    });
+  } catch (err) {
+    console.error('Error starting walk', err);
+    return res.status(500).json({ error: 'Failed to start walk' });
+  }
 });
 
-app.get('/api/reservations', (req, res) => {
+// 예약 목록
+app.get('/api/reservations', async (req, res) => {
   const sql = `
     SELECT
       r.id,
@@ -251,17 +220,17 @@ app.get('/api/reservations', (req, res) => {
     ORDER BY r.date, r.time, r.id
   `;
 
-  db.all(sql, (err, rows) => {
-    if (err) {
-      console.error('Error fetching reservations', err);
-      return res.status(500).json({ error: 'Failed to fetch reservations' });
-    }
-
+  try {
+    const [rows] = await pool.query(sql);
     res.json(rows);
-  });
+  } catch (err) {
+    console.error('Error fetching reservations', err);
+    return res.status(500).json({ error: 'Failed to fetch reservations' });
+  }
 });
 
-app.post('/api/reservations/:id/cancel', (req, res) => {
+// 예약 ID 기준 취소
+app.post('/api/reservations/:id/cancel', async (req, res) => {
   const reservationId = req.params.id;
   const { reserverName, reserverPhone } = req.body || {};
 
@@ -282,11 +251,9 @@ app.post('/api/reservations/:id/cancel', (req, res) => {
     WHERE r.id = ?
   `;
 
-  db.get(sql, [reservationId], (err, row) => {
-    if (err) {
-      console.error('Error fetching reservation for cancel', err);
-      return res.status(500).json({ error: 'Failed to fetch reservation' });
-    }
+  try {
+    const [rows] = await pool.query(sql, [reservationId]);
+    const row = rows[0];
 
     if (!row) {
       return res.status(404).json({ error: 'Reservation not found' });
@@ -297,39 +264,30 @@ app.post('/api/reservations/:id/cancel', (req, res) => {
       row.reserverPhone !== reserverPhone ||
       row.status !== 'reserved'
     ) {
-      return res.status(400).json({ error: '예약 정보가 일치하지 않거나 이미 처리된 예약입니다.' });
+      return res
+        .status(400)
+        .json({ error: '예약 정보가 일치하지 않거나 취소할 수 없는 상태입니다.' });
     }
 
-    db.serialize(() => {
-      db.run(
-        'UPDATE reservations SET status = ? WHERE id = ?',
-        ['cancelled', reservationId],
-        (updateErr) => {
-          if (updateErr) {
-            console.error('Error cancelling reservation', updateErr);
-            return res.status(500).json({ error: 'Failed to cancel reservation' });
-          }
+    await pool.query('UPDATE reservations SET status = ? WHERE id = ?', [
+      'cancelled',
+      reservationId,
+    ]);
 
-          // 예약이 취소되면 강아지를 다시 available로
-          db.run(
-            'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ? AND status = ?',
-            ['available', row.dogId, 'reserved'],
-            (dogErr) => {
-              if (dogErr) {
-                console.error('Error resetting dog after cancel', dogErr);
-              }
+    await pool.query(
+      'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ? AND status = ?',
+      ['available', row.dogId, 'reserved']
+    );
 
-              return res.json({ id: row.id, dogId: row.dogId, status: 'cancelled' });
-            }
-          );
-        }
-      );
-    });
-  });
+    return res.json({ id: row.id, dogId: row.dogId, status: 'cancelled' });
+  } catch (err) {
+    console.error('Error cancelling reservation', err);
+    return res.status(500).json({ error: 'Failed to cancel reservation' });
+  }
 });
 
-// 강아지 기준으로 최신 예약을 취소 (예약자 정보 검증)
-app.post('/api/dogs/:id/cancel-reservation', (req, res) => {
+// 강아지 기준 최신 예약 취소
+app.post('/api/dogs/:id/cancel-reservation', async (req, res) => {
   const dogId = req.params.id;
   const { reserverName, reserverPhone } = req.body || {};
 
@@ -337,83 +295,71 @@ app.post('/api/dogs/:id/cancel-reservation', (req, res) => {
     return res.status(400).json({ error: 'reserverName and reserverPhone are required' });
   }
 
-  db.get(
-    `SELECT id, status, reserver_name AS reserverName, reserver_phone AS reserverPhone
-     FROM reservations
-     WHERE dog_id = ?
-     ORDER BY id DESC
-     LIMIT 1`,
-    [dogId],
-    (err, row) => {
-      if (err) {
-        console.error('Error fetching reservation for dog cancel', err);
-        return res.status(500).json({ error: 'Failed to fetch reservation' });
-      }
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, status, reserver_name AS reserverName, reserver_phone AS reserverPhone
+       FROM reservations
+       WHERE dog_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [dogId]
+    );
+    const row = rows[0];
 
-      if (!row) {
-        return res.status(404).json({ error: 'Reservation not found' });
-      }
-
-      if (
-        row.reserverName !== reserverName ||
-        row.reserverPhone !== reserverPhone ||
-        row.status !== 'reserved'
-      ) {
-        return res
-          .status(400)
-          .json({ error: '예약 정보가 일치하지 않거나 이미 처리된 예약입니다.' });
-      }
-
-      db.serialize(() => {
-        db.run(
-          'UPDATE reservations SET status = ? WHERE id = ?',
-          ['cancelled', row.id],
-          (updateErr) => {
-            if (updateErr) {
-              console.error('Error cancelling reservation by dog', updateErr);
-              return res.status(500).json({ error: 'Failed to cancel reservation' });
-            }
-
-            db.run(
-              'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ? AND status = ?',
-              ['available', dogId, 'reserved'],
-              (dogErr) => {
-                if (dogErr) {
-                  console.error('Error resetting dog after cancel by dog', dogErr);
-                }
-
-                return res.json({
-                  dogId: Number(dogId),
-                  reservationId: row.id,
-                  status: 'cancelled',
-                });
-              }
-            );
-          }
-        );
-      });
+    if (!row) {
+      return res.status(404).json({ error: 'Reservation not found' });
     }
-  );
+
+    if (
+      row.reserverName !== reserverName ||
+      row.reserverPhone !== reserverPhone ||
+      row.status !== 'reserved'
+    ) {
+      return res
+        .status(400)
+        .json({ error: '예약 정보가 일치하지 않거나 취소할 수 없는 상태입니다.' });
+    }
+
+    await pool.query('UPDATE reservations SET status = ? WHERE id = ?', [
+      'cancelled',
+      row.id,
+    ]);
+
+    await pool.query(
+      'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ? AND status = ?',
+      ['available', dogId, 'reserved']
+    );
+
+    return res.json({
+      dogId: Number(dogId),
+      reservationId: row.id,
+      status: 'cancelled',
+    });
+  } catch (err) {
+    console.error('Error cancelling reservation by dog', err);
+    return res.status(500).json({ error: 'Failed to cancel reservation' });
+  }
 });
 
-app.post('/api/dogs/:id/reset', (req, res) => {
+// 강아지 상태 강제 리셋
+app.post('/api/dogs/:id/reset', async (req, res) => {
   const dogId = req.params.id;
 
-  db.run(
-    'UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ?',
-    ['available', dogId],
-    (err) => {
-      if (err) {
-        console.error('Error resetting dog to available', err);
-        return res.status(500).json({ error: 'Failed to reset dog status' });
-      }
+  try {
+    await pool.query('UPDATE dogs SET status = ?, currentWalkEnd = NULL WHERE id = ?', [
+      'available',
+      dogId,
+    ]);
 
-      return res.json({ dogId: Number(dogId), status: 'available' });
-    }
-  );
+    return res.json({ dogId: Number(dogId), status: 'available' });
+  } catch (err) {
+    console.error('Error resetting dog to available', err);
+    return res.status(500).json({ error: 'Failed to reset dog status' });
+  }
 });
 
-const checkAndCompleteWalks = () => {
+// 자동으로 산책 완료 처리 + 날짜 지난 completed 리셋
+const checkAndCompleteWalks = async () => {
   const sql = `
     SELECT
       id as dogId,
@@ -422,88 +368,64 @@ const checkAndCompleteWalks = () => {
     WHERE status = 'walking'
   `;
 
-  db.all(sql, (err, rows) => {
-    if (err) {
-      console.error('Error checking walking dogs', err);
-      return;
-    }
-
+  try {
+    const [rows] = await pool.query(sql);
     const now = new Date();
 
-    rows.forEach((row) => {
+    for (const row of rows) {
       if (!row.currentWalkEnd) {
-        return;
+        continue;
       }
 
       const today = new Date().toISOString().slice(0, 10);
-      const endDate = new Date(`${today}T${row.currentWalkEnd}:00`);
+      const endDate = new Date(`${today}T${row.currentWalkEnd}`);
 
       if (now >= endDate) {
         const lastWalkTime = row.currentWalkEnd;
 
-        db.serialize(() => {
-          db.run(
-            'UPDATE dogs SET status = ?, lastWalkTime = ?, currentWalkEnd = NULL WHERE id = ?',
-            ['completed', lastWalkTime, row.dogId],
-            (updateErr) => {
-              if (updateErr) {
-                console.error('Error auto-completing walk', updateErr);
-              }
-            }
-          );
+        await pool.query(
+          'UPDATE dogs SET status = ?, lastWalkTime = ?, currentWalkEnd = NULL WHERE id = ?',
+          ['completed', lastWalkTime, row.dogId]
+        );
 
-          db.run(
-            `UPDATE reservations
-             SET status = 'completed', walk_end_time = ?, completed_by = 'auto'
-             WHERE id = (
-               SELECT MAX(id) FROM reservations WHERE dog_id = ?
-             )`,
-            [lastWalkTime, row.dogId],
-            (resErr) => {
-              if (resErr) {
-                console.error('Error auto-updating reservation status', resErr);
-              }
-            }
-          );
-        });
-      }
-    });
-  });
-
-  // 날짜가 바뀐 뒤에도 'completed'로 남아 있는 강아지들은 목록에서 자동 제거
-  const today = new Date().toISOString().slice(0, 10);
-  const clearSql = `
-    SELECT
-      d.id as dogId,
-      r.date
-    FROM dogs d
-    JOIN reservations r ON r.dog_id = d.id
-    WHERE d.status = 'completed'
-      AND r.id = (
-        SELECT MAX(id) FROM reservations r2 WHERE r2.dog_id = d.id
-      )
-  `;
-
-  db.all(clearSql, (err, rows) => {
-    if (err) {
-      console.error('Error checking completed dogs for reset', err);
-      return;
-    }
-
-    rows.forEach((row) => {
-      if (row.date < today) {
-        db.run(
-          'UPDATE dogs SET status = ?, lastWalkTime = NULL, currentWalkEnd = NULL WHERE id = ?',
-          ['available', row.dogId],
-          (updateErr) => {
-            if (updateErr) {
-              console.error('Error resetting old completed dog', updateErr);
-            }
-          }
+        await pool.query(
+          `UPDATE reservations
+           SET status = 'completed', walk_end_time = ?, completed_by = 'auto'
+           WHERE id = (
+             SELECT MAX(id) FROM reservations WHERE dog_id = ?
+           )`,
+          [lastWalkTime, row.dogId]
         );
       }
-    });
-  });
+    }
+
+    // 날짜가 지난 completed 상태 강아지들을 available로 리셋
+    const today = new Date().toISOString().slice(0, 10);
+    const clearSql = `
+      SELECT
+        d.id as dogId,
+        r.date
+      FROM dogs d
+      JOIN reservations r ON r.dog_id = d.id
+      WHERE d.status = 'completed'
+        AND r.id = (
+          SELECT MAX(id) FROM reservations r2 WHERE r2.dog_id = d.id
+        )
+    `;
+
+    const [clearRows] = await pool.query(clearSql);
+
+    for (const row of clearRows) {
+      if (row.date < today) {
+        await pool.query(
+          'UPDATE dogs SET status = ?, lastWalkTime = NULL, currentWalkEnd = NULL WHERE id = ?',
+          ['available', row.dogId]
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Error checking/completing walks', err);
+  }
 };
 
 app.listen(PORT, () => {
