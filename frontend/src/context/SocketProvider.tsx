@@ -1,4 +1,6 @@
-import { createContext, useContext, ReactNode } from 'react';
+import { createContext, useContext } from 'react';
+import type { ReactNode } from 'react';
+
 
 interface SocketContextType {
     // Socket 관련 메서드들을 여기에 추가할 수 있습니다
